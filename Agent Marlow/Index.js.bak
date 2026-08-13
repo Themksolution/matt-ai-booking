@@ -1,0 +1,845 @@
+import Fastify from "fastify";
+import dotenv from "dotenv";
+import WebSocket from "ws";
+import fastifyWs from "@fastify/websocket";
+import fastifyFormBody from "@fastify/formbody";
+import twilio from "twilio";
+import { twiml as generateTwiml } from "./twiml.js";
+import OpenAI from "openai";
+
+dotenv.config();
+
+import Airtable from "airtable";
+const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
+  process.env.AIRTABLE_BASE_ID
+);
+const scriptsTable = base("Scripts");
+const teamsTable = base("Teams");
+
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  OPENAI_API_KEY,
+  DOMAIN,
+  PORT = 6060,
+} = process.env;
+
+const VOICE = "sage";
+// const VOICE = "echo";
+// const VOICE = "fable";
+// const VOICE = "verse";
+// const VOICE = "nova";
+// const VOICE = "shimmer";
+
+let COMPANY_NAME = "";
+let DEPARTMENT_NAME = "";
+let TOP_INTENT = "";
+let INTENT_SCORE = "0";
+let SYSTEM_TAG = "";
+let SYSTEM_MESSAGE = "";
+let FROM_NUMBER = "";
+let TO_NUMBER = "";
+let firstTimer = "";
+let secondTimer = "";
+let durationString = "";
+let callSid = "";
+let dateNow = "";
+let timeNow = "";
+const LOG_EVENTS = [
+  "session.created",
+  "response.audio.delta",
+  "response.content.done",
+  "error",
+];
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// const tools = [
+//   {
+//     name: "classify_intent",
+//     description: `Classify the user's original intent based only on the assistant's reply message.
+
+// Only call this function if the user's intent is absolutely clear from the assistant's message.
+
+// Use a single lowercase snake_case word for the intent (e.g., "book_appointment", "request_info", "cancel_subscription", etc.).
+
+// Optionally include relevant metadata like company or department if it's explicitly or implicitly clear.`,
+//     parameters: {
+//       type: "object",
+//       properties: {
+//         intent: {
+//           type: "string",
+//           description:
+//             "A single lowercase snake_case word representing the user's intent.",
+//           pattern: "^[a-z]+(_[a-z]+)*$",
+//         },
+//         message: {
+//           type: "string",
+//           description:
+//             "Optional: brief explanation of how the assistant's message reveals the user's intent.",
+//         },
+//         intent_score: {
+//           type: "number",
+//           description:
+//             "Confidence score from 0 to 1 indicating how clear or certain the assistant is about the user's intent.",
+//           minimum: 0,
+//           maximum: 1,
+//         },
+//         company_name: {
+//           type: "string",
+//           description:
+//             "Optional: name of the company mentioned or implied in the message.",
+//         },
+//         department_name: {
+//           type: "string",
+//           description:
+//             "Optional: name of the department involved in the intent, if relevant.",
+//         },
+//       },
+//       required: ["intent"],
+//     },
+//   },
+// ];
+
+console.log("🚀 Starting server setup...");
+const fastify = Fastify();
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+fastify.get("/", async () => {
+  return { message: "Incoming call AI server running." };
+});
+
+const fetchScripts = async () => {
+  try {
+    const response = await fetch("http://159.223.123.144:5100/scripts");
+    const data = await response.json();
+
+    if (Array.isArray(data)) {
+      return data;
+    } else {
+      console.error("❌ Unexpected data format:", data);
+      return [];
+    }
+  } catch (err) {
+    console.error("❌ Failed to get scripts data:", err);
+    return [];
+  }
+};
+
+const getRandomScript = (scripts, tag) => {
+  const filteredScripts = scripts.filter((script) => script.fields.Tag === tag);
+  if (filteredScripts.length === 0) return null;
+
+  const randomIndex = Math.floor(Math.random() * filteredScripts.length);
+  return filteredScripts[randomIndex].fields.Scripts;
+};
+
+const selectScriptForCall = async () => {
+  const scripts = await fetchScripts();
+  const tag = Math.random() > 0.5 ? "A" : "B";
+  const selectedScript = getRandomScript(scripts, tag);
+
+  if (selectedScript) {
+    console.log(`🔑 Using script from Tag ${tag}:`, selectedScript);
+    SYSTEM_TAG = tag;
+    SYSTEM_MESSAGE = selectedScript;
+    console.log("sacbsjkabcjksabc", SYSTEM_MESSAGE);
+    console.log("sacbsjkabcjksabcsadsad", SYSTEM_TAG);
+
+    return selectedScript;
+  } else {
+    console.log("❌ No scripts available for the selected tag.");
+    return null;
+  }
+};
+
+//   selectScriptForCall()
+
+fastify.get("/scripts", (req, res) => {
+  let results = [];
+
+  scriptsTable.select().eachPage(
+    function page(records, fetchNextPage) {
+      records.forEach((record) => {
+        results.push({ id: record.id, fields: record.fields });
+      });
+      fetchNextPage();
+    },
+    function done(err) {
+      if (err) {
+        console.error("Airtable error:", err);
+        res.status(500).send({ error: err.message });
+      } else {
+        res.send(results);
+      }
+    }
+  );
+});
+
+fastify.post("/voice", async (req, reply) => {
+  // console.log(req.body)
+  const { From } = req.body;
+  const { CallSid } = req.body;
+  const { To } = req.body;
+  console.log("To Number", To);
+  console.log("From Number", From);
+  console.log("call SId", CallSid);
+  callSid = CallSid;
+  FROM_NUMBER = From;
+  TO_NUMBER = To;
+  try {
+    const todaysDate = new Date();
+    const formattedDate = todaysDate.toLocaleDateString("en-US", {
+      day: "2-digit",
+      month: "long",
+      year: "numeric",
+    });
+    const formattedTime = todaysDate.toLocaleTimeString();
+    console.log("Date:", formattedDate);
+    console.log("Time:", formattedTime);
+    dateNow = formattedDate;
+    timeNow = formattedTime;
+    selectScriptForCall();
+    console.log("📞 /voice POST hit");
+    const twimlResponse = generateTwiml(DOMAIN);
+    firstTimer = Date.now();
+
+    reply.header("Content-Type", "text/xml").send(twimlResponse);
+    console.log(twimlResponse);
+  } catch (err) {
+    console.error("❌ Error in /voice route:", err);
+    reply.status(500).send("Server Error");
+  }
+});
+
+const reconnectWebSocket = (ws, url, options = {}) => {
+  const reconnectDelay = 5000;
+  ws.on("close", () => {
+    console.log("❌ WebSocket closed. Attempting to reconnect...");
+    setTimeout(() => {
+      const newWs = new WebSocket(url, options);
+      reconnectWebSocket(newWs, url, options);
+    }, reconnectDelay);
+  });
+
+  ws.on("error", (error) => {
+    console.error("❌ WebSocket error:", error);
+    ws.close();
+  });
+};
+
+fastify.register(async function (fastify) {
+  fastify.get("/media-stream", { websocket: true }, (conn) => {
+    console.log("🔌 Twilio WebSocket connected");
+
+    let aiWs;
+    try {
+      aiWs = new WebSocket(
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "OpenAI-Beta": "realtime=v1",
+          },
+        }
+      );
+
+      reconnectWebSocket(
+        aiWs,
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            "OpenAI-Beta": "realtime=v1",
+          },
+        }
+      );
+    } catch (err) {
+      console.error("❌ Failed to connect to OpenAI WebSocket:", err);
+      return;
+    }
+
+    let streamSid = null;
+    let assistantIsSpeaking = false;
+    let waitingForTurnToFinish = false;
+
+    const initSession = () => {
+      try {
+        aiWs.send(
+          JSON.stringify({
+            type: "session.update",
+            session: {
+              turn_detection: { type: "server_vad" },
+              input_audio_format: "g711_ulaw",
+              output_audio_format: "g711_ulaw",
+              voice: VOICE,
+              // instructions: `You are a helpful AI assistant that helps users with their needs. If it's clear what the user wants, you MUST call the 'classify_intent' function with the correct intent name in snake_case.
+              // Example intents: book_appointment, request_info, cancel_appointment.
+
+              // Only call the function if the user intent is absolutely clear based on their message.
+              // Do not make assumptions. Just call the function if you're sure.
+
+              // After replying to the user, trigger the function.
+
+              // `,
+              instructions: SYSTEM_MESSAGE,
+
+              modalities: ["text", "audio"],
+              tools: [
+                {
+                  type: "function",
+                  name: "classify_intent",
+                  description: `Classify the user's original intent 
+
+Only call this function if the user's intent is absolutely clear from the assistant's message.
+
+Use a single lowercase snake_case word for the intent (e.g., "book_appointment", "request_info", "cancel_subscription", etc.).
+
+Optionally include relevant metadata like company or department if it's explicitly or implicitly clear.`,
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      intent: {
+                        type: "string",
+                        description:
+                          "A single lowercase snake_case word representing the user's intent.",
+                        pattern: "^[a-z]+(_[a-z]+)*$",
+                      },
+                      message: {
+                        type: "string",
+                        description:
+                          "Optional: brief explanation of how the assistant's message reveals the user's intent.",
+                      },
+                      intent_score: {
+                        type: "number",
+                        description:
+                          "Confidence score from 0 to 1 indicating how clear or certain the assistant is about the user's intent.",
+                        minimum: 0,
+                        maximum: 1,
+                      },
+                      company_name: {
+                        type: "string",
+                        description:
+                          "Optional: name of the company mentioned or implied in the message.",
+                      },
+                      department_name: {
+                        type: "string",
+                        description:
+                          "Optional: name of the department involved in the intent, if relevant.",
+                      },
+                    },
+                    required: ["intent"],
+                  },
+                },
+              ],
+            },
+          })
+        );
+        aiWs.send(
+          JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+              type: "message",
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: "Greet the caller warmly and ask how can you assisst him today",
+                },
+              ],
+            },
+          })
+        );
+
+        aiWs.send(JSON.stringify({ type: "response.create" }));
+        console.log("✅ Session initialized with OpenAI.");
+      } catch (err) {
+        console.error("❌ Error during session.init:", err);
+      }
+    };
+
+    aiWs.on("open", () => {
+      console.log("✅ Connected to OpenAI realtime.");
+      setTimeout(initSession, 100);
+
+      setTimeout(() => {
+        if (aiWs && aiWs.readyState === WebSocket.OPEN) {
+          console.log("⏱️ 45 seconds passed. Closing OpenAI WebSocket...");
+          aiWs.close();
+        }
+        if (conn.socket && conn.socket.readyState === WebSocket.OPEN) {
+          conn.socket.send(JSON.stringify({ event: "stop" }));
+          console.log("Sent 'stop' to Twilio to end call.");
+          twilioClient
+            .calls(callSid)
+            .update({ status: "completed" })
+            .then((call) => console.log("✅ Call ended."))
+            .catch((err) => console.error("❌ Error:", err));
+        }
+      }, 60000);
+    });
+
+    let toolCallBuffer = "";
+
+    aiWs.on("message", async (msg) => {
+      try {
+        const res = JSON.parse(msg);
+        if (LOG_EVENTS.includes(res.type))
+          if (res.type === "error") {
+            // console.log("📥 OpenAI Event:", res.type);
+            console.log("📥 OpenAI Event:", res);
+          }
+
+        if (res.type === "response.audio.delta" && res.delta) {
+          assistantIsSpeaking = true;
+          const audio = {
+            event: "media",
+            streamSid,
+            media: {
+              payload: Buffer.from(res.delta, "base64").toString("base64"),
+            },
+          };
+          conn.socket.send(JSON.stringify(audio));
+        }
+
+        if (res.type === "response.content.done") {
+          assistantIsSpeaking = false;
+          waitingForTurnToFinish = false;
+        }
+
+        if (res.type === "conversation.turn.started") {
+          console.log("🗣️ User started speaking");
+          if (
+            assistantIsSpeaking &&
+            !waitingForTurnToFinish &&
+            aiWs.readyState === WebSocket.OPEN
+          ) {
+            console.log("🛑 Stopping assistant due to user turn...");
+            aiWs.send(JSON.stringify({ type: "response.stop" }));
+            waitingForTurnToFinish = true;
+          }
+        }
+
+        if (res.type === "conversation.turn.stopped") {
+          console.log("✅ User turn ended, generating response...");
+          waitingForTurnToFinish = false;
+          if (aiWs.readyState === WebSocket.OPEN) {
+            aiWs.send(JSON.stringify({ type: "response.create" }));
+          }
+        }
+
+        if (res.type === "response.content_part.done" && res.part?.transcript) {
+          console.log(`OpenAI said: ${res.part.transcript}`);
+        }
+
+        if (res.type === "response.function_call_arguments.delta") {
+          if (res.delta) {
+            toolCallBuffer += res.delta;
+          } else {
+            console.log("csbsjkcb not working");
+          }
+        }
+
+        // if (res.type === "response.function_call_arguments.done") {
+        //   console.log("✅ Assistant is calling function with args:");
+        //   try {
+        //     const parsed = JSON.parse(toolCallBuffer);
+        //     console.log(parsed);
+        //     toolCallBuffer = "";
+
+        //     console.log("............................");
+        //   } catch (err) {
+        //     console.error("❌ Failed to parse function args:", toolCallBuffer);
+        //   }
+        // }
+
+        if (res.type === "response.function_call_arguments.done") {
+          console.log("✅ Assistant is calling function with args:");
+          try {
+            const parsed = JSON.parse(toolCallBuffer);
+            console.log(parsed);
+            toolCallBuffer = "";
+
+            console.log("............................");
+
+            // 🔽 Your existing logic adapted and added here
+            const args = parsed;
+
+            const userIntent = args.intent || null;
+            const intentScore =
+              typeof args.intent_score === "number" ? args.intent_score : "0";
+            console.log("Raw intent score from OpenAI:", args.intent_score);
+
+            if (!TOP_INTENT) {
+              TOP_INTENT = userIntent;
+              console.log("Saved user intent:", userIntent);
+            } else {
+              console.log("Intent already saved:", TOP_INTENT);
+            }
+
+            if (INTENT_SCORE === "0") {
+              INTENT_SCORE = intentScore;
+              console.log("Saved intent score:", intentScore);
+            } else {
+              console.log(
+                "Intent score already saved or invalid:",
+                INTENT_SCORE
+              );
+            }
+
+            const companyName = args.company_name || null;
+            const departmentName = args.department_name || null;
+
+            if (!COMPANY_NAME) {
+              COMPANY_NAME = companyName;
+              console.log("Saved company name:", companyName);
+            }
+
+            if (!DEPARTMENT_NAME) {
+              DEPARTMENT_NAME = departmentName;
+              console.log("Saved department name:", departmentName);
+            }
+          } catch (err) {
+            console.error("❌ Failed to parse function args:", toolCallBuffer);
+          }
+        }
+      } catch (err) {
+        console.error("❌ Error parsing OpenAI message:", err);
+      }
+    });
+
+    conn.socket.on("message", (msg) => {
+      try {
+        const data = JSON.parse(msg);
+        if (data.event === "start") {
+          streamSid = data.start.streamSid;
+          console.log("▶️ Twilio stream started:", streamSid);
+        }
+
+        if (data.event === "media" && aiWs.readyState === WebSocket.OPEN) {
+          aiWs.send(
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: data.media.payload,
+            })
+          );
+        }
+      } catch (err) {
+        console.error("❌ Error handling Twilio WS message:", err);
+      }
+    });
+
+    conn.socket.on("close", () => {
+      console.log("❌ Twilio WebSocket disconnected.");
+      if (aiWs.readyState === WebSocket.OPEN) aiWs.close();
+      secondTimer = Date.now();
+      const durationInSeconds = Math.floor((secondTimer - firstTimer) / 1000);
+      if (durationInSeconds < 60) {
+        durationString = `${durationInSeconds} second${
+          durationInSeconds !== 1 ? "s" : ""
+        }`;
+      } else {
+        const minutes = Math.floor(durationInSeconds / 60);
+        const seconds = durationInSeconds % 60;
+        durationString = `${minutes} minute${minutes !== 1 ? "s" : ""}`;
+        if (seconds > 0) {
+          durationString += ` ${seconds} second${seconds !== 1 ? "s" : ""}`;
+        }
+      }
+
+      if (TOP_INTENT && INTENT_SCORE) {
+        console.log("durationInSeconds", durationInSeconds);
+        console.log("duration string", durationString);
+
+        console.log("sbckjbasjkcbasjkcbkasjbcjkscba", TOP_INTENT, INTENT_SCORE);
+
+        teamsTable.create(
+          [
+            {
+              fields: {
+                intent: TOP_INTENT,
+                Lead_Score: INTENT_SCORE,
+                Script_tag: SYSTEM_TAG,
+                From_Number: FROM_NUMBER,
+                To_Number: TO_NUMBER,
+                Department: DEPARTMENT_NAME,
+                Company: COMPANY_NAME,
+                Duration: durationString,
+                Date: dateNow,
+                Time: timeNow,
+                Call_SID: callSid,
+              },
+            },
+          ],
+          (err, records) => {
+            if (err) {
+              console.error("❌ Airtable insert failed:", err.message);
+              return;
+            }
+            console.log(
+              "✅ Airtable insert success:",
+              records.map((r) => ({ id: r.id, fields: r.fields }))
+            );
+
+            let recordId = null;
+
+            if (SYSTEM_TAG === "A") {
+              // recordId = "reckC6ETo33yMetGK";
+                  recordId = "recTOG8nsQOrLjONY";
+            } else if (SYSTEM_TAG === "B") {
+              // recordId = "recBW4ZiZonJ9YbTH";
+                        recordId = "recyvf1pWFi6qbg2L";
+
+            } else {
+              console.error(
+                "❌ Invalid SYSTEM_TAG. Expected 'A' or 'B'. Got:",
+                SYSTEM_TAG
+              );
+              return;
+            }
+
+            scriptsTable.find(recordId, (err, record) => {
+              if (err) {
+                console.error("❌ Error fetching record by ID:", err);
+                return;
+              }
+
+              console.log("✅ Found record:", record.fields);
+
+              const currentSuccess = record.fields.Success || 0;
+              const newSuccess = currentSuccess + 1;
+
+              scriptsTable.update(
+                recordId,
+                { Success: newSuccess },
+                (err, updatedRecord) => {
+                  if (err) {
+                    console.error("❌ Error updating record:", err);
+                  } else {
+                    console.log(
+                      `✅ Successfully incremented Success to ${updatedRecord.fields.Success}`
+                    );
+                  }
+                }
+              );
+            });
+
+            TOP_INTENT = "";
+            INTENT_SCORE = "0";
+            SYSTEM_TAG = "";
+            SYSTEM_MESSAGE = "";
+            FROM_NUMBER = "";
+            firstTimer = "";
+            secondTimer = "";
+            durationString = "";
+            callSid = "";
+            dateNow = "";
+            timeNow = "";
+            TO_NUMBER = "";
+            DEPARTMENT_NAME = "";
+            COMPANY_NAME = "";
+
+            console.log("new intent score", INTENT_SCORE);
+          }
+        );
+      } else {
+        console.log("⚠️ No intent detected.");
+
+        let recordId = null;
+
+        if (SYSTEM_TAG === "A") {
+          // recordId = "reckC6ETo33yMetGK";
+          recordId = "recTOG8nsQOrLjONY";
+
+        } else if (SYSTEM_TAG === "B") {
+          // recordId = "recBW4ZiZonJ9YbTH";
+          recordId = "recyvf1pWFi6qbg2L";
+        } else {
+          console.error(
+            "❌ Invalid SYSTEM_TAG. Expected 'A' or 'B'. Got:",
+            SYSTEM_TAG
+          );
+          return;
+        }
+
+        scriptsTable.find(recordId, (err, record) => {
+          if (err) {
+            console.error("❌ Error fetching record by ID:", err);
+            return;
+          }
+
+          console.log("✅ Found record:", record.fields);
+
+          const currentFailed = record.fields.Failed || 0;
+          const newFailed = currentFailed + 1;
+
+          scriptsTable.update(
+            recordId,
+            { Failed: newFailed },
+            (err, updatedRecord) => {
+              if (err) {
+                console.error("❌ Error updating record:", err);
+              } else {
+                console.log(
+                  `✅ Successfully incremented Failed to ${updatedRecord.fields.Failed}`
+                );
+              }
+            }
+          );
+        });
+
+        TOP_INTENT = "";
+        INTENT_SCORE = "0";
+        SYSTEM_TAG = "";
+        SYSTEM_MESSAGE = "";
+        FROM_NUMBER = "";
+        firstTimer = "";
+        secondTimer = "";
+        durationString = "";
+        callSid = "";
+        dateNow = "";
+        timeNow = "";
+        TO_NUMBER = "";
+
+        console.log("new intent score", INTENT_SCORE);
+      }
+    });
+
+    aiWs.on("close", () => console.log("❌ OpenAI WebSocket closed."));
+    aiWs.on("error", (e) => console.error("❌ OpenAI WebSocket error:", e));
+  });
+});
+
+
+fastify.listen({ host: "0.0.0.0", port: PORT }, (err, address) => {
+  if (err) {
+    console.error("❌ Server failed to start:", err);
+    process.exit(1);
+  }
+  console.log(`🚀 Server ready at ${address}`);
+});
+
+//////////////////////////////////////////////////////
+//           const transcript = res.part.transcript;
+//           const classification = await openai.chat.completions.create({
+//             model: "gpt-4o-mini",
+//             messages: [
+//               //               {
+//               //                 role: "system",
+//               //                 content: `
+//               // You are an intent classifier working inside an AI voice assistant.
+
+//               // Your job is to look at the **assistant's own reply** and guess what the **user's original intent** was — using a single lowercase snake_case word.
+
+//               // Only classify if:
+//               // - The assistant’s reply shows exactly what the user wanted.
+//               // - There’s no ambiguity or request for clarification.
+//               // - The intent is extremely clear and specific.
+
+//               // ⚠️ Do NOT classify if:
+//               // - The assistant says “How can I help you?”, “Please clarify”, or “I didn’t understand.”
+//               // - The assistant is asking follow-up questions or giving generic replies.
+
+//               // ✅ Example classifications:
+//               // Assistant: “Great, I’ve booked the appointment for you.” → intent: book_appointment
+//               // Assistant: “Your account has been deleted.” → intent: delete_account
+//               // Assistant: “The issue is fixed now.” → intent: request_support
+
+//               // ❌ Don’t classify:
+//               // Assistant: “Sorry, I didn’t understand that.” → No intent
+//               // Assistant: “Can you clarify?” → No intent
+//               // Assistant: “Hello, how may I help you?” → No intent
+
+//               // If user mentions their company name or department name, you must repeat it like this:
+//               // "Your company name is [company_name] and department name is [department_name], I have noted."
+//               //       `,
+//               //               },
+//               {
+//                 role: "system",
+//                 content: `
+// You are an intent classifier working inside an AI voice assistant.
+
+// Your job is to look at the **assistant's own reply** and guess what the **user's original intent** was — using a single lowercase snake_case word.
+
+// Only classify if:
+// - The assistant’s reply shows exactly what the user wanted.
+// - There’s no ambiguity or request for clarification.
+// - The intent is extremely clear and specific.
+
+// ⚠️ Do NOT classify if:
+// - The assistant says “How can I help you?”, “Please clarify”, or “I didn’t understand.”
+// - The assistant is asking follow-up questions or giving generic replies.
+
+// ✅ Example classifications:
+// Assistant: “Great, I’ve booked the appointment for you.” → intent: book_appointment
+// Assistant: “Your account has been deleted.” → intent: delete_account
+// Assistant: “The issue is fixed now.” → intent: request_support
+
+// ❌ Don’t classify:
+// Assistant: “Sorry, I didn’t understand that.” → No intent
+// Assistant: “Can you clarify?” → No intent
+// Assistant: “Hello, how may I help you?” → No intent
+
+// If user mentions their company name or department name, you must repeat it like this:
+// "Your company name is [company_name] and department name is [department_name], I have noted."
+//       `,
+//               },
+//               {
+//                 role: "user",
+//                 content: transcript,
+//               },
+//             ],
+//             functions: tools,
+//             function_call: "auto",
+//           });
+//           const message = classification.choices[0].message;
+//           if (message.function_call) {
+//             try {
+//               const args = JSON.parse(message.function_call.arguments);
+
+//               const userIntent = args.intent || null;
+//               const intentScore =
+//                 typeof args.intent_score === "number"
+//                   ? args.intent_score
+//                   : null;
+//               console.log("Raw intent score from OpenAI:", args.intent_score);
+
+//               if (!TOP_INTENT) {
+//                 TOP_INTENT = userIntent;
+//                 console.log("Saved user intent:", userIntent);
+//               } else {
+//                 console.log("Intent already saved:", TOP_INTENT);
+//               }
+
+//               if (INTENT_SCORE === "0") {
+//                 INTENT_SCORE = intentScore;
+//                 console.log("Saved intent score:", intentScore);
+//               } else {
+//                 console.log(
+//                   "Intent score already saved or invalid:",
+//                   INTENT_SCORE
+//                 );
+//               }
+
+//               const companyName = args.company_name || null;
+//               const departmentName = args.department_name || null;
+
+//               if (!COMPANY_NAME) {
+//                 COMPANY_NAME = companyName;
+//                 console.log("Saved company name:", companyName);
+//               }
+
+//               if (!DEPARTMENT_NAME) {
+//                 DEPARTMENT_NAME = departmentName;
+//                 console.log("Saved department name:", departmentName);
+//               }
+//             } catch (e) {
+//               console.error("Error parsing function_call arguments:", e);
+//             }
+//           } else {
+//             console.log("No intent classified.");
+//           }
