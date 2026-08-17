@@ -815,6 +815,8 @@ const handleAppointmentRequest =
       }
     }
 
+    context.sendAppointmentLookupHoldMessage?.();
+
     const allUpcomingSlots =
       await fetchFareharbourSlots();
     const preferredSlots =
@@ -1095,6 +1097,16 @@ fastify.register(async function (fastifyInstance) {
           })
         );
       };
+
+      const sendAppointmentLookupHoldMessage =
+        () => {
+          sendAssistantFollowUp(
+            'Say exactly: "Please wait while I check the available slots for you. Stay with me."'
+          );
+        };
+
+      wsContext.sendAppointmentLookupHoldMessage =
+        sendAppointmentLookupHoldMessage;
 
       const initSession = () => {
         try {
