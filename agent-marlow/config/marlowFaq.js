@@ -1,6 +1,6 @@
 export const BUSINESS_NAME = "Marlow Boating";
 
-export const BUSINESS_GREETING = "Hi, this is Marlow Boating. How can I help you today?";
+export const BUSINESS_GREETING = "Marlow Boating, how can I help you?";
 
 export const FAQ_ENTRIES = [
   {

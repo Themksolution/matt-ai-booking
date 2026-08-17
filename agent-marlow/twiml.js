@@ -18,7 +18,6 @@ import twilio from "twilio";
 export function twiml(domain) {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
-  twiml.play(`https://${domain}/beep2.mp3`);
 
   const connect = twiml.connect();
   connect.stream({

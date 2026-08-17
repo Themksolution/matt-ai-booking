@@ -32,16 +32,35 @@ const {
   OPENAI_API_KEY,
   DOMAIN,
   LIVE_AGENT_NUMBER,
+  TOKEN_FAREHARBOUR,
+  OPENAI_REALTIME_MODEL,
+  OPENAI_VOICE,
   PORT = 5100,
 } = process.env;
 
-const VOICE = "shimmer";
-const REALTIME_MODEL = "gpt-realtime-1.5";
+const VOICE = OPENAI_VOICE || "marin";
+const REALTIME_MODEL =
+  OPENAI_REALTIME_MODEL ||
+  "gpt-realtime";
+const AUDIO_OUTPUT_SPEED = 1.0;
+const VOICE_STYLE_INSTRUCTIONS =
+  "Speak in a natural British English accent with a warm, polished, human delivery. Use British phrasing and pronunciation naturally, without sounding exaggerated or theatrical. Sound conversational rather than scripted, use light contractions, and keep a normal phone-call pace with brief pauses only where they help clarity.";
+const FAREHARBOUR_CALENDAR_URL =
+  "https://fareharbor.com/integrations/ics/marlowboating/calendar/";
+const FAREHARBOUR_TIME_ZONE =
+  "Europe/London";
+const APPOINTMENT_SLOT_LIMIT = 3;
+const FAREHARBOUR_CACHE_TTL_MS = 30000;
 
 const mongoClient = new MongoClient(MONGODB_URI);
 
 let mongoDb;
 let callsCollection;
+let fareharbourSlotsCache = {
+  fetchedAt: 0,
+  slots: [],
+  pendingRequest: null,
+};
 
 const connectMongoDB = async () => {
   try {
@@ -215,6 +234,702 @@ const findBestFaqMatch = (question = "") => {
   };
 };
 
+const buildFareharbourCalendarUrl = () => {
+  if (!TOKEN_FAREHARBOUR) {
+    throw new Error(
+      "TOKEN_FAREHARBOUR is not defined in .env"
+    );
+  }
+
+  const url = new URL(
+    FAREHARBOUR_CALENDAR_URL
+  );
+  url.searchParams.set(
+    "token",
+    TOKEN_FAREHARBOUR
+  );
+  return url.toString();
+};
+
+const unfoldIcsLines = (icsText = "") =>
+  icsText
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .reduce((lines, line) => {
+      if (/^[ \t]/.test(line) && lines.length) {
+        lines[lines.length - 1] +=
+          line.slice(1);
+      } else {
+        lines.push(line);
+      }
+      return lines;
+    }, []);
+
+const parseIcsParameters = (
+  propertyPart = ""
+) =>
+  propertyPart
+    .split(";")
+    .slice(1)
+    .reduce((params, parameter) => {
+      const [key, ...valueParts] =
+        parameter.split("=");
+      if (key) {
+        params[key.toUpperCase()] =
+          valueParts
+            .join("=")
+            .replace(/^"|"$/g, "");
+      }
+      return params;
+    }, {});
+
+const getTimeZoneOffsetMs = (
+  date,
+  timeZone
+) => {
+  const parts =
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      timeZoneName: "shortOffset",
+    }).formatToParts(date);
+
+  const timeZoneName =
+    parts.find(
+      (part) =>
+        part.type === "timeZoneName"
+    )?.value || "GMT";
+
+  const match = timeZoneName.match(
+    /^GMT(?:(?<sign>[+-])(?<hours>\d{1,2})(?::(?<minutes>\d{2}))?)?$/
+  );
+
+  if (!match?.groups?.sign) {
+    return 0;
+  }
+
+  const sign =
+    match.groups.sign === "-" ? -1 : 1;
+  const hours = Number(
+    match.groups.hours || 0
+  );
+  const minutes = Number(
+    match.groups.minutes || 0
+  );
+
+  return (
+    sign *
+    (hours * 60 + minutes) *
+    60 *
+    1000
+  );
+};
+
+const zonedDateToUtc = (
+  year,
+  month,
+  day,
+  hour,
+  minute,
+  second,
+  timeZone
+) => {
+  const utcDate = new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day,
+      hour,
+      minute,
+      second
+    )
+  );
+  const offsetMs =
+    getTimeZoneOffsetMs(
+      utcDate,
+      timeZone
+    );
+
+  return new Date(
+    utcDate.getTime() - offsetMs
+  );
+};
+
+const parseIcsDate = (
+  value = "",
+  parameters = {}
+) => {
+  const cleanValue = value.trim();
+  const dateMatch = cleanValue.match(
+    /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/
+  );
+
+  if (!dateMatch) {
+    return null;
+  }
+
+  const [
+    ,
+    year,
+    month,
+    day,
+    hour = "00",
+    minute = "00",
+    second = "00",
+    utcMarker,
+  ] = dateMatch;
+
+  if (utcMarker) {
+    return new Date(
+      Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+      )
+    );
+  }
+
+  return zonedDateToUtc(
+    Number(year),
+    Number(month),
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    parameters.TZID ||
+      FAREHARBOUR_TIME_ZONE
+  );
+};
+
+const getSlotDateKey = (date) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: FAREHARBOUR_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+
+const getSlotTimeKey = (date) =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: FAREHARBOUR_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+
+const formatAppointmentSlot = (
+  slot
+) => {
+  const dateText =
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: FAREHARBOUR_TIME_ZONE,
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    }).format(slot.start);
+
+  const startTime =
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: FAREHARBOUR_TIME_ZONE,
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).format(slot.start);
+
+  const endTime = slot.end
+    ? new Intl.DateTimeFormat("en-GB", {
+        timeZone:
+          FAREHARBOUR_TIME_ZONE,
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      }).format(slot.end)
+    : null;
+
+  return `${dateText} at ${startTime}${endTime ? ` to ${endTime}` : ""}`;
+};
+
+const parseFareharbourSlots = (
+  icsText
+) => {
+  const lines = unfoldIcsLines(icsText);
+  const slots = [];
+  let event = null;
+
+  for (const line of lines) {
+    if (line === "BEGIN:VEVENT") {
+      event = {};
+      continue;
+    }
+
+    if (line === "END:VEVENT") {
+      if (
+        event?.start &&
+        event.status !== "CANCELLED"
+      ) {
+        slots.push({
+          uid: event.uid || "",
+          title: event.summary || "",
+          start: event.start,
+          end: event.end || null,
+          dateKey: getSlotDateKey(
+            event.start
+          ),
+          timeKey: getSlotTimeKey(
+            event.start
+          ),
+        });
+      }
+      event = null;
+      continue;
+    }
+
+    if (!event) {
+      continue;
+    }
+
+    const colonIndex = line.indexOf(":");
+    if (colonIndex === -1) {
+      continue;
+    }
+
+    const propertyPart = line.slice(
+      0,
+      colonIndex
+    );
+    const value = line.slice(
+      colonIndex + 1
+    );
+    const propertyName =
+      propertyPart
+        .split(";")[0]
+        .toUpperCase();
+    const parameters =
+      parseIcsParameters(
+        propertyPart
+      );
+
+    if (propertyName === "DTSTART") {
+      event.start = parseIcsDate(
+        value,
+        parameters
+      );
+    }
+
+    if (propertyName === "DTEND") {
+      event.end = parseIcsDate(
+        value,
+        parameters
+      );
+    }
+
+    if (propertyName === "SUMMARY") {
+      event.summary = value;
+    }
+
+    if (propertyName === "UID") {
+      event.uid = value;
+    }
+
+    if (propertyName === "STATUS") {
+      event.status =
+        value.toUpperCase();
+    }
+  }
+
+  return slots.sort(
+    (a, b) => a.start - b.start
+  );
+};
+
+const fetchFareharbourSlots = async () => {
+  const now = new Date();
+  const cachedSlots =
+    fareharbourSlotsCache.slots.filter(
+      (slot) => slot.start > now
+    );
+
+  if (
+    fareharbourSlotsCache.fetchedAt &&
+    now.getTime() -
+      fareharbourSlotsCache.fetchedAt <
+      FAREHARBOUR_CACHE_TTL_MS
+  ) {
+    return cachedSlots;
+  }
+
+  if (fareharbourSlotsCache.pendingRequest) {
+    const slots =
+      await fareharbourSlotsCache.pendingRequest;
+    return slots.filter(
+      (slot) => slot.start > now
+    );
+  }
+
+  fareharbourSlotsCache.pendingRequest =
+    (async () => {
+      const response = await fetch(
+        buildFareharbourCalendarUrl()
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `FareHarbor calendar request failed with status ${response.status}`
+        );
+      }
+
+      const icsText =
+        await response.text();
+      const slots =
+        parseFareharbourSlots(icsText);
+
+      fareharbourSlotsCache = {
+        fetchedAt: Date.now(),
+        slots,
+        pendingRequest: null,
+      };
+
+      return slots;
+    })();
+
+  try {
+    const slots =
+      await fareharbourSlotsCache.pendingRequest;
+    return slots.filter(
+      (slot) => slot.start > now
+    );
+  } catch (error) {
+    fareharbourSlotsCache.pendingRequest =
+      null;
+    throw error;
+  }
+};
+
+const getRequestedSlotNumber = (
+  parsed = {}
+) => {
+  if (
+    Number.isInteger(
+      parsed.selected_slot_number
+    )
+  ) {
+    return parsed.selected_slot_number;
+  }
+
+  const request = normalizeText(
+    parsed.request || ""
+  );
+  const numberMatch = request.match(
+    /\b(?:option|slot)?\s*([123])\b/
+  );
+
+  if (numberMatch) {
+    return Number(numberMatch[1]);
+  }
+
+  if (
+    /\b(first|one)\b/.test(request)
+  ) {
+    return 1;
+  }
+
+  if (
+    /\b(second|two)\b/.test(request)
+  ) {
+    return 2;
+  }
+
+  if (
+    /\b(third|three)\b/.test(request)
+  ) {
+    return 3;
+  }
+
+  return null;
+};
+
+const normalizePreferredTime = (
+  value = ""
+) => {
+  const normalized =
+    normalizeText(value);
+
+  if (!normalized) {
+    return "";
+  }
+
+  const timeMatch = normalized.match(
+    /\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?\b/
+  );
+
+  if (!timeMatch) {
+    return normalized;
+  }
+
+  let hour = Number(timeMatch[1]);
+  const minute = Number(
+    timeMatch[2] || 0
+  );
+  const meridiem = timeMatch[3];
+
+  if (meridiem === "pm" && hour < 12) {
+    hour += 12;
+  }
+
+  if (meridiem === "am" && hour === 12) {
+    hour = 0;
+  }
+
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+};
+
+const filterSlotsByPreference = (
+  slots,
+  parsed = {}
+) => {
+  const preferredDate =
+    parsed.preferred_date || "";
+  const preferredTime =
+    normalizePreferredTime(
+      parsed.preferred_time || ""
+    );
+  const normalizedRequest =
+    normalizeText(parsed.request || "");
+
+  return slots.filter((slot) => {
+    if (
+      preferredDate &&
+      slot.dateKey !== preferredDate
+    ) {
+      return false;
+    }
+
+    if (
+      preferredTime &&
+      slot.timeKey !== preferredTime
+    ) {
+      return false;
+    }
+
+    if (
+      !preferredTime &&
+      /\bmorning\b/.test(
+        normalizedRequest
+      )
+    ) {
+      return (
+        Number(
+          slot.timeKey.slice(0, 2)
+        ) < 12
+      );
+    }
+
+    if (
+      !preferredTime &&
+      /\bafternoon\b/.test(
+        normalizedRequest
+      )
+    ) {
+      const hour = Number(
+        slot.timeKey.slice(0, 2)
+      );
+      return hour >= 12 && hour < 17;
+    }
+
+    if (
+      !preferredTime &&
+      /\bevening\b/.test(
+        normalizedRequest
+      )
+    ) {
+      return (
+        Number(
+          slot.timeKey.slice(0, 2)
+        ) >= 17
+      );
+    }
+
+    return true;
+  });
+};
+
+const prepareAppointmentSlots = (
+  slots
+) =>
+  slots
+    .slice(0, APPOINTMENT_SLOT_LIMIT)
+    .map((slot, index) => ({
+      option: index + 1,
+      uid: slot.uid,
+      title: slot.title,
+      date: slot.dateKey,
+      time: slot.timeKey,
+      detail: formatAppointmentSlot(
+        slot
+      ),
+    }));
+
+const listAppointmentOptions = (
+  slots
+) =>
+  slots
+    .map(
+      (slot) =>
+        `option ${slot.option}: ${slot.detail}`
+    )
+    .join("; ");
+
+const handleAppointmentRequest =
+  async (parsed, context) => {
+    const selectedSlotNumber =
+      getRequestedSlotNumber(parsed);
+
+    if (
+      selectedSlotNumber &&
+      context.availableAppointmentSlots
+        ?.length
+    ) {
+      const selectedSlot =
+        context.availableAppointmentSlots.find(
+          (slot) =>
+            slot.option === selectedSlotNumber
+        );
+
+      if (selectedSlot) {
+        context.confirmedAppointment =
+          selectedSlot;
+
+        return {
+          output: {
+            status: "confirmed",
+            slot: selectedSlot,
+          },
+          responseInstruction:
+            `Tell the caller their appointment is confirmed for ${selectedSlot.detail}. Use one warm sentence. Do not add a generic closing phrase.`,
+          skipFollowUp: false,
+        };
+      }
+    }
+
+    const allUpcomingSlots =
+      await fetchFareharbourSlots();
+    const preferredSlots =
+      filterSlotsByPreference(
+        allUpcomingSlots,
+        parsed
+      );
+    const hasSpecificPreference =
+      Boolean(
+        parsed.preferred_date ||
+          parsed.preferred_time ||
+          /\bmorning\b|\bafternoon\b|\bevening\b/.test(
+            normalizeText(
+              parsed.request || ""
+            )
+          )
+      );
+    const hasExactPreferredSlot =
+      Boolean(
+        parsed.preferred_date &&
+          parsed.preferred_time
+      );
+
+    if (
+      hasExactPreferredSlot &&
+      preferredSlots.length
+    ) {
+      const [slot] =
+        prepareAppointmentSlots(
+          preferredSlots
+        );
+      context.availableAppointmentSlots =
+        [slot];
+      context.confirmedAppointment =
+        slot;
+
+      return {
+        output: {
+          status: "confirmed",
+          slot,
+        },
+        responseInstruction:
+          `Tell the caller that slot is available and their appointment is confirmed for ${slot.detail}. Use one warm sentence. Do not add a generic closing phrase.`,
+        skipFollowUp: false,
+      };
+    }
+
+    if (
+      hasSpecificPreference &&
+      preferredSlots.length
+    ) {
+      const matchingSlots =
+        prepareAppointmentSlots(
+          preferredSlots
+        );
+      context.availableAppointmentSlots =
+        matchingSlots;
+
+      return {
+        output: {
+          status: "preferred_slots_found",
+          slots: matchingSlots,
+        },
+        responseInstruction:
+          `Tell the caller you found availability matching their request. Offer only these slots: ${listAppointmentOptions(matchingSlots)}. Ask which option they would like. Do not add any extra closing phrase.`,
+        skipFollowUp: false,
+      };
+    }
+
+    const nextSlots =
+      prepareAppointmentSlots(
+        allUpcomingSlots
+      );
+    context.availableAppointmentSlots =
+      nextSlots;
+
+    if (!nextSlots.length) {
+      return {
+        output: {
+          status: "no_slots_found",
+          slots: [],
+        },
+        responseInstruction:
+          "Tell the caller briefly that you cannot find any available appointment slots right now and ask them to call back shortly. Do not add any extra closing phrase.",
+        skipFollowUp: false,
+      };
+    }
+
+    if (
+      hasSpecificPreference &&
+      !preferredSlots.length
+    ) {
+      return {
+        output: {
+          status:
+            "preferred_slot_unavailable",
+          slots: nextSlots,
+        },
+        responseInstruction:
+          `Tell the caller that their requested time is not available. Then offer only these upcoming slots: ${listAppointmentOptions(nextSlots)}. Ask which option they would like. Do not add any extra closing phrase.`,
+        skipFollowUp: false,
+      };
+    }
+
+    return {
+      output: {
+        status: "available_slots",
+        slots: nextSlots,
+      },
+      responseInstruction:
+        `Offer only these next available appointment slots: ${listAppointmentOptions(nextSlots)}. Ask which option they would like. Do not add any extra closing phrase.`,
+      skipFollowUp: false,
+    };
+  };
+
 const createTransferTwiml = (destinationNumber) => {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const response = new VoiceResponse();
@@ -316,6 +1031,8 @@ fastify.register(async function (fastifyInstance) {
         faqMatched: false,
         faqEscalated: false,
         appointmentRequested: false,
+        availableAppointmentSlots: [],
+        confirmedAppointment: null,
         transferRequested: false,
         transferSucceeded: false,
         lastToolUsed: "",
@@ -366,19 +1083,17 @@ fastify.register(async function (fastifyInstance) {
           return;
         }
 
-        setTimeout(() => {
-          aiWs.send(
-            JSON.stringify({
-              type: "response.create",
-              response: {
-                instructions: instruction,
-                output_modalities: [
-                  "audio",
-                ],
-              },
-            })
-          );
-        }, 500);
+        aiWs.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              instructions: instruction,
+              output_modalities: [
+                "audio",
+              ],
+            },
+          })
+        );
       };
 
       const initSession = () => {
@@ -405,6 +1120,11 @@ fastify.register(async function (fastifyInstance) {
                     },
                     turn_detection: {
                       type: "server_vad",
+                      threshold: 0.5,
+                      prefix_padding_ms: 300,
+                      silence_duration_ms: 350,
+                      create_response: true,
+                      interrupt_response: true,
                     },
                   },
                   output: {
@@ -412,24 +1132,37 @@ fastify.register(async function (fastifyInstance) {
                       type: "audio/pcmu",
                     },
                     voice: VOICE,
+                    speed: AUDIO_OUTPUT_SPEED,
                   },
                 },
                 // Business-specific answers must come from the FAQ source rather than
                 // model knowledge so the voice agent does not invent company information.
                 instructions: `You are a short, calm phone receptionist for ${BUSINESS_NAME}.
 
-The caller has already heard the opening audio greeting. Continue naturally from there.
+You are answering the phone. Your first spoken response on every call must be exactly: "${BUSINESS_GREETING}"
+Today is ${wsContext.dateNow}.
 
 Rules:
+- ${VOICE_STYLE_INSTRUCTIONS}
 - Keep phone responses brief, warm, and direct.
 - Speak clearly and naturally for a phone call, with short sentences and no hype.
-- Most answers should be one short sentence. Use two short sentences only when needed.
+- Do not speak quickly. The caller should feel the pace is calm, attentive, and human.
+- Use natural British English vocabulary and tone.
+- Avoid sounding robotic, overly cheerful, or like you are reading from a script.
+- Answer the caller's actual question first, then stop unless a useful next step is obvious.
+- Engage naturally with the caller: a brief acknowledgement is fine, then ask one relevant follow-up question when it helps move the call forward.
+- Do not add padding, summaries of your abilities, or generic closing phrases.
+- Never say things like "I hope that helps", "please let me know what else I can help with", "I'm here to help in any way I can", or "I've got lots of information".
+- Do not ask "anything else?" after every answer. Ask a specific, useful question instead, or say nothing more.
+- Most answers should be one or two short sentences. Use a third sentence only when it is genuinely needed.
 - If the caller asks a business-specific question about pricing, policies, location, services, process, availability, booking details, qualifications, hours, or company details, call get_faq_answer before answering.
 - The FAQ source is authoritative. Do not answer business-specific questions from your own knowledge.
 - If get_faq_answer returns found false, do not guess or improvise. Say exactly: "Transferring your call, hold back." Then call transfer_to_live_agent.
 - If the caller explicitly asks for a person, agent, representative, or human help, say exactly: "Transferring your call, hold back." Then call transfer_to_live_agent immediately.
 - If the caller asks to book, schedule, reserve, or make an appointment, call request_appointment.
-- Appointment booking is under development. Do not invent availability, time slots, or confirmations.
+- If the caller accepts one of the offered appointment options, call request_appointment again with intent choose_slot and selected_slot_number.
+- If the caller asks for a specific date or time, call request_appointment with intent find_availability, preferred_date as YYYY-MM-DD when known, and preferred_time as HH:mm in 24-hour time when known.
+- Appointment availability and confirmations must come from request_appointment. Do not invent availability, time slots, or confirmations.
 - You may answer small conversational questions naturally, such as who you are, but do not invent business facts that are not in the FAQ.
 - Ask at most one short follow-up question only when it is genuinely needed to understand the caller's request.
 - Never mention tools, APIs, the FAQ file, function calls, or internal logic.`,
@@ -461,14 +1194,38 @@ Rules:
                     type: "function",
                     name: "request_appointment",
                     description:
-                      "Handle appointment and booking requests while the real appointment API is not connected yet.",
+                      "Check FareHarbor appointment availability, offer the next slots, and confirm the caller's selected slot.",
                     parameters: {
                       type: "object",
                       properties: {
+                        intent: {
+                          type: "string",
+                          enum: [
+                            "find_availability",
+                            "choose_slot",
+                          ],
+                          description:
+                            "Use find_availability for new booking requests or preferred dates/times. Use choose_slot when the caller accepts one of the offered options.",
+                        },
                         request: {
                           type: "string",
                           description:
                             "The caller's appointment or booking request in plain language.",
+                        },
+                        selected_slot_number: {
+                          type: "integer",
+                          description:
+                            "The offered slot number the caller chose, such as 1, 2, or 3.",
+                        },
+                        preferred_date: {
+                          type: "string",
+                          description:
+                            "The caller's requested date as YYYY-MM-DD when they ask for a specific date.",
+                        },
+                        preferred_time: {
+                          type: "string",
+                          description:
+                            "The caller's requested start time as HH:mm in 24-hour time when they ask for a specific time.",
                         },
                       },
                       required: [
@@ -502,24 +1259,13 @@ Rules:
 
           aiWs.send(
             JSON.stringify({
-              type:
-                "conversation.item.create",
-              item: {
-                type: "message",
-                role: "user",
-                content: [
-                  {
-                    type: "input_text",
-                    text: BUSINESS_GREETING,
-                  },
+              type: "response.create",
+              response: {
+                instructions: `Say exactly: "${BUSINESS_GREETING}"`,
+                output_modalities: [
+                  "audio",
                 ],
               },
-            })
-          );
-
-          aiWs.send(
-            JSON.stringify({
-              type: "response.create",
             })
           );
 
@@ -538,7 +1284,7 @@ Rules:
         console.log(
           "Connected to OpenAI realtime."
         );
-        setTimeout(initSession, 100);
+        initSession();
       });
 
       aiWs.on(
@@ -613,22 +1359,10 @@ Rules:
               "conversation.turn.stopped"
             ) {
               console.log(
-                "User turn ended, generating response..."
+                "User turn ended."
               );
 
               waitingForTurnToFinish = false;
-
-              if (
-                aiWs.readyState ===
-                WebSocket.OPEN
-              ) {
-                aiWs.send(
-                  JSON.stringify({
-                    type:
-                      "response.create",
-                  })
-                );
-              }
             }
 
             if (
@@ -1070,7 +1804,7 @@ async function handleFunctionCall(
       output: result,
       // Unknown FAQ questions must transfer rather than improvise answers.
       responseInstruction: result.found
-        ? "Answer the caller in one short sentence using only the returned FAQ answer. If a very short follow-up is necessary, ask only one brief question."
+        ? "Answer the caller in one or two short sentences using only the returned FAQ answer. If a very short follow-up is useful, ask one specific question. Do not add filler, reassurance, capability summaries, or generic closing phrases."
         : 'Say exactly: "Transferring your call, hold back." Then call transfer_to_live_agent with reason "faq_unavailable".',
       skipFollowUp: false,
     };
@@ -1088,18 +1822,27 @@ async function handleFunctionCall(
       "Appointment requested."
     );
 
-    return {
-      output: {
-        status: "pending_api",
-        request:
-          parsed.request || "",
-      },
-      // Appointment booking currently only returns a controlled pending state
-      // so callers are not given fake availability or false confirmations.
-      responseInstruction:
-        'Say exactly: "Appointment booking is under development right now."',
-      skipFollowUp: false,
-    };
+    try {
+      return await handleAppointmentRequest(
+        parsed,
+        context
+      );
+    } catch (error) {
+      console.error(
+        "Appointment lookup failed:",
+        error.message
+      );
+
+      return {
+        output: {
+          status: "appointment_lookup_failed",
+          message: error.message,
+        },
+        responseInstruction:
+          "Tell the caller briefly that you cannot check appointment availability right now and ask them to call back shortly. Do not add any extra closing phrase.",
+        skipFollowUp: false,
+      };
+    }
   }
 
   if (
